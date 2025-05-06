@@ -1,0 +1,367 @@
+import { Stagehand, Page, BrowserContext } from "@browserbasehq/stagehand";
+import StagehandConfig from "./stagehand.config.js";
+import chalk from "chalk";
+import boxen from "boxen";
+import { performance } from "perf_hooks";
+
+/**
+ * 🤘 Welcome to Stagehand! Thanks so much for trying us out!
+ * 🛠️ CONFIGURATION: stagehand.config.ts will help you configure Stagehand
+ *
+ * 📝 Check out our docs for more fun use cases, like building agents
+ * https://docs.stagehand.dev/
+ *
+ * 💬 If you have any feedback, reach out to us on Slack!
+ * https://stagehand.dev/slack
+ *
+ * 📚 You might also benefit from the docs for Zod, Browserbase, and Playwright:
+ * - https://zod.dev/
+ * - https://docs.browserbase.com/
+ * - https://playwright.dev/docs/intro
+ */
+
+// Define the search criteria
+const SEARCH_TOPIC = "large language models"; // Replace with your desired topic
+const PUBLICATION_YEAR = "2024"; // Replace with the desired year (or adjust logic for specific date)
+const MAX_ABSTRACT_LENGTH = 300; // Limit abstract length to avoid token limit issues
+const MAX_PAPERS = 3; // Reduce from 5 to 3 to limit response size
+
+async function main({
+  page,
+  context,
+  stagehand,
+}: {
+  page: Page; // Playwright Page with act, extract, and observe methods
+  context: BrowserContext; // Playwright BrowserContext
+  stagehand: Stagehand; // Stagehand instance
+}) {
+  stagehand.log({
+    category: "arxiv-scraper",
+    message: `Starting arXiv scrape for topic: "${SEARCH_TOPIC}", year: ${PUBLICATION_YEAR}`,
+  });
+
+  const startTime = performance.now();
+  // Navigate to arXiv advanced search
+  await page.goto("https://arxiv.org/search/advanced");
+  stagehand.log({ category: "arxiv-scraper", message: "Navigated to advanced search page" });
+
+  // Fill in the search form
+  // Search in Title field for the topic
+  await page.act("click the computer science checkbox in the subject field")
+
+  await page.act(`Type "${SEARCH_TOPIC}" into the input field with current value "Title"`);
+
+  // Filter by publication year
+  await page.act(`Click specific year in the date section and type in "${PUBLICATION_YEAR}" for the year`);
+
+  // Submit the search
+  await page.locator('button.button.is-link.is-medium').filter({ hasText: 'Search' }).first().click();
+
+  stagehand.log({ category: "arxiv-scraper", message: "Submitted search query" });
+
+  await page.waitForLoadState("domcontentloaded");
+
+  // Increase default timeout for locators (default is 30000ms)
+  page.setDefaultTimeout(60000); // 60 seconds
+
+  // Use native Playwright selectors to extract paper information instead of AI extraction
+  // This avoids context length limitations
+  stagehand.log({ category: "arxiv-scraper", message: "Extracting search results using Playwright selectors" });
+  
+  // Log the current URL to debug
+  stagehand.log({ category: "arxiv-scraper", message: `Current URL: ${page.url()}` });
+  
+  // Wait for content to be fully loaded
+  await page.waitForTimeout(2000);
+  
+  // Inspect the page structure to find the right selectors
+  const pageContent = await page.content();
+  // Log a small portion of the page content to help debug (avoid token limits)
+  stagehand.log({ 
+    category: "arxiv-scraper", 
+    message: `Page content sample (first 200 chars): ${pageContent.substring(0, 200)}...` 
+  });
+
+  // Try different selectors that might work on arXiv search results
+  // - Direct descendant of search-results container
+  // - Articles with class names that might be used
+  const possibleSelectors = [
+    'li.arxiv-result',
+    'ol.breathe-horizontal > li',
+    'div.results > ul > li',
+    'div.search-results li'
+  ];
+  
+  let paperElements: any[] = [];
+  
+  // Try each selector until we find something
+  for (const selector of possibleSelectors) {
+    try {
+      stagehand.log({ category: "arxiv-scraper", message: `Trying selector: ${selector}` });
+      paperElements = await page.locator(selector).all();
+      if (paperElements.length > 0) {
+        stagehand.log({ category: "arxiv-scraper", message: `Found ${paperElements.length} elements with selector: ${selector}` });
+        break;
+      }
+    } catch (e: unknown) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      stagehand.log({ category: "arxiv-scraper", message: `Selector ${selector} failed: ${errorMessage}` });
+    }
+  }
+  
+  if (!paperElements || paperElements.length === 0) {
+    stagehand.log({ category: "arxiv-scraper", message: "No paper elements found with any of the attempted selectors. Taking a screenshot to debug." });
+    
+    // Take a screenshot to debug
+    try {
+      await page.screenshot({ path: './arxiv-search-results.png' });
+      stagehand.log({ category: "arxiv-scraper", message: "Screenshot saved as arxiv-search-results.png" });
+    } catch (e: unknown) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      stagehand.log({ category: "arxiv-scraper", message: `Failed to save screenshot: ${errorMessage}` });
+    }
+    
+    return;
+  }
+  
+  // Extract basic information from each paper
+  const topPapersLinks = [];
+  for (let i = 0; i < Math.min(paperElements.length, MAX_PAPERS); i++) {
+    const element = paperElements[i];
+    
+    try {
+      // Log the outerHTML of the first element to debug (limited to avoid token issues)
+      if (i === 0) {
+        const html = await element.evaluate((el: HTMLElement) => el.outerHTML.substring(0, 300));
+        stagehand.log({ category: "arxiv-scraper", message: `First element HTML sample: ${html}...` });
+      }
+      
+      // Try different selectors for title - arXiv might use different class names
+      let title = "Title not found";
+      for (const selector of ['p.title', '.list-title', '.title', 'h3']) {
+        try {
+          const titleElement = await element.locator(selector).first();
+          const text = await titleElement.textContent({ timeout: 5000 });
+          if (text) {
+            title = text;
+            break;
+          }
+        } catch (e: unknown) {
+          // Continue to next selector
+        }
+      }
+      
+      // Try different selectors for authors
+      let authors = [];
+      for (const selector of ['p.authors', '.list-authors', '.authors', '.meta']) {
+        try {
+          const authorsElement = await element.locator(selector).first();
+          const authorsText = await authorsElement.textContent({ timeout: 5000 }) || "";
+          if (authorsText) {
+            authors = authorsText.split(',').map((author: string) => author.trim()).filter(Boolean);
+            break;
+          }
+        } catch (e: unknown) {
+          // Continue to next selector
+        }
+      }
+      
+      // Try different selectors for abstract link
+      let abstractLink = "";
+      for (const selector of ['a.abstract-link', 'a[href*="/abs/"]', 'a:has-text("abstract")']) {
+        try {
+          const linkElement = await element.locator(selector).first();
+          const href = await linkElement.getAttribute('href', { timeout: 5000 }) || "";
+          if (href) {
+            abstractLink = href.startsWith('http') ? href : `https://arxiv.org${href}`;
+            break;
+          }
+        } catch (e: unknown) {
+          // Continue to next selector
+        }
+      }
+      
+      // If we still don't have an abstract link, try to get any link that might be relevant
+      if (!abstractLink) {
+        try {
+          const allLinks = await element.locator('a').all();
+          for (const link of allLinks) {
+            const href = await link.getAttribute('href');
+            if (href && (href.includes('/abs/') || href.includes('arxiv.org'))) {
+              abstractLink = href.startsWith('http') ? href : `https://arxiv.org${href}`;
+              break;
+            }
+          }
+        } catch (e: unknown) {
+          // Skip if we can't find a link
+        }
+      }
+      
+      if (!abstractLink) {
+        stagehand.log({ category: "arxiv-scraper", message: `Could not find abstract link for paper ${i+1}` });
+        continue; // Skip this paper if we can't find a link
+      }
+      
+      topPapersLinks.push({
+        title: title.replace(/^\s*Title:\s*/i, '').trim(),
+        authors,
+        abstractLink
+      });
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      stagehand.log({ 
+        category: "arxiv-scraper", 
+        message: `Error processing paper element ${i+1}: ${errorMessage}` 
+      });
+    }
+  }
+  
+  stagehand.log({ 
+    category: "arxiv-scraper", 
+    message: `Found ${topPapersLinks.length} papers, extracting details...`
+  });
+
+  const detailedPapers = [];
+
+  // Loop through the papers and visit their abstract pages
+  for (let i = 0; i < Math.min(topPapersLinks.length, MAX_PAPERS); i++) {
+    const paperLink = topPapersLinks[i];
+    stagehand.log({ category: "arxiv-scraper", message: `Processing paper ${i + 1}: ${paperLink.title}` });
+    await page.goto(paperLink.abstractLink);
+    await page.waitForLoadState("domcontentloaded");
+
+    try {
+      // Extract abstract text
+      const abstractElement = await page.locator('blockquote.abstract').first();
+      const abstractText = await abstractElement.textContent() || "Abstract not found";
+      const cleanAbstract = abstractText.replace(/^Abstract:\s*/i, '').trim();
+      
+      // Truncate abstract to limit usage
+      const truncatedAbstract = cleanAbstract.length > MAX_ABSTRACT_LENGTH 
+        ? cleanAbstract.substring(0, MAX_ABSTRACT_LENGTH) + "..." 
+        : cleanAbstract;
+      
+      // Extract submission date
+      const dateElement = await page.locator('div.dateline').first();
+      const submissionDate = await dateElement.textContent() || "Date not found";
+      
+      // Extract arXiv ID from URL or element
+      const urlPath = paperLink.abstractLink.split('/').pop() || "";
+      const arxivId = urlPath.includes('v') ? urlPath : `arXiv:${urlPath}`;
+      
+      // Extract DOI if available
+      let doi = "Not available";
+      const doiElement = await page.locator('a[href*="doi.org"]').first();
+      if (doiElement) {
+        doi = await doiElement.getAttribute('href') || "Not available";
+      }
+      
+      // Add citation count if available (usually not on arXiv)
+      const citationCount = "N/A"; // Not directly available on arXiv
+      
+      detailedPapers.push({
+        ...paperLink,
+        abstract: truncatedAbstract,
+        submissionDate,
+        doi,
+        arxivId,
+        citationCount,
+      });
+      
+      stagehand.log({ 
+        category: "arxiv-scraper", 
+        message: `Successfully extracted details for paper ${i + 1}` 
+      });
+      
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      stagehand.log({
+        category: "arxiv-scraper",
+        message: `Failed to extract details for paper ${i + 1}: ${paperLink.title}`,
+        auxiliary: {
+          error: {
+            value: error instanceof Error ? error.message : JSON.stringify(error),
+            type: "string",
+          },
+        },
+      });
+      
+      // Add partial data if extraction failed
+      detailedPapers.push({
+        ...paperLink,
+        abstract: "Extraction Failed",
+        submissionDate: "Extraction Failed",
+        doi: "Not available",
+        arxivId: "Extraction Failed",
+        citationCount: "N/A",
+      });
+    }
+  }
+
+  // Log the final results
+  stagehand.log({
+    category: "arxiv-scraper",
+    message: "Finished scraping.",
+    auxiliary: {
+      results: {
+        value: JSON.stringify(detailedPapers, null, 2),
+        type: "object",
+      },
+    },
+  });
+
+  // You can also log to console if preferred
+  // console.log("--- Final Results ---");
+  // console.log(JSON.stringify(detailedPapers, null, 2));
+  // console.log("---------------------");
+
+  const endTime = performance.now();
+  const executionTime = (endTime - startTime) / 1000;
+  console.log(chalk.green(`Cerebras script completed in ${executionTime.toFixed(2)} seconds`));
+
+  return detailedPapers;
+}
+
+/**
+ * This is the main function that runs when you do npm run start
+ *
+ * YOU PROBABLY DON'T NEED TO MODIFY ANYTHING BELOW THIS POINT!
+ *
+ */
+async function run() {
+  const stagehand = new Stagehand({
+    ...StagehandConfig,
+  });
+  await stagehand.init();
+
+  if (StagehandConfig.env === "BROWSERBASE" && stagehand.browserbaseSessionID) {
+    console.log(
+      boxen(
+        `View this session live in your browser: \n${chalk.blue(
+          `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`,
+        )}`,
+        {
+          title: "Browserbase",
+          padding: 1,
+          margin: 3,
+        },
+      ),
+    );
+  }
+
+  const page = stagehand.page;
+  const context = stagehand.context;
+  await main({
+    page,
+    context,
+    stagehand,
+  });
+  await stagehand.close();
+  console.log(
+    `\n🤘 Thanks so much for using Stagehand! Reach out to us on Slack if you have any feedback: ${chalk.blue(
+      "https://stagehand.dev/slack",
+    )}\n`,
+  );
+}
+
+run();
